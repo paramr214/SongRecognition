@@ -4,3 +4,4 @@ librosa
 matplotlib
 soundfile
 audioread
+gdown
