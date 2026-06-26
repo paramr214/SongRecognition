@@ -234,11 +234,32 @@ def get_local_ip():
         return "127.0.0.1"
 
 
+# ── Batch processing helper ───────────────────────────────────
+def process_audio_file(file_bytes, suffix, database, confidence_thresh=5):
+    """Run the full fingerprint pipeline on raw bytes. Returns (best_song, best_count, offset_histogram, spectrogram, freqs, times, peaks, fingerprints)."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+    try:
+        x, fs = librosa.load(tmp_path, sr=22050)
+        if len(x.shape) == 2:
+            x = x[:, 0]
+        spectrogram, freqs, times = compute_spectrogram(x, fs)
+        spectrogram_db = 20 * np.log10(spectrogram + 1)
+        peaks = find_peaks(spectrogram_db, freqs)
+        fingerprints, _ = build_fingerprints(peaks, freqs, times)
+        best_song, best_count, offset_histogram = match_fingerprints(
+            fingerprints, database, confidence_thresh
+        )
+    finally:
+        os.unlink(tmp_path)
+    return best_song, best_count, offset_histogram, spectrogram, freqs, times, peaks, fingerprints
+
+
 # ══════════════════════════════════════════════════════════════
 #  UI
 # ══════════════════════════════════════════════════════════════
 st.title("🎵 Song Recognition App")
-st.markdown("Upload a short audio clip and the app will identify the song from the database.")
 
 # Sidebar ── network info
 with st.sidebar:
@@ -263,39 +284,31 @@ if database is None:
 
 st.success(f"✅ Database loaded — {len(database):,} unique fingerprint hashes")
 
-# Upload
-uploaded = st.file_uploader("Upload an audio clip (MP3 / WAV)", type=["mp3", "wav"])
+# ── Tabs ──────────────────────────────────────────────────────
+tab1, tab2 = st.tabs(["🎵 Single File", "📂 Batch Mode"])
 
-if uploaded:
-    st.audio(uploaded, format="audio/mp3")
 
-    if st.button("🔍 Identify Song"):
-        with st.spinner("Analysing audio…"):
-            # Save to temp file (librosa needs a path)
-            suffix = ".mp3" if uploaded.name.endswith(".mp3") else ".wav"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                tmp.write(uploaded.read())
-                tmp_path = tmp.name
+# ══════════════════════════════════════════════════════════════
+#  TAB 1 — Single File
+# ══════════════════════════════════════════════════════════════
+with tab1:
+    st.markdown("Upload a short audio clip and the app will identify the song from the database.")
 
-            try:
-                x, fs = librosa.load(tmp_path, sr=22050)
-                if len(x.shape) == 2:
-                    x = x[:, 0]
+    uploaded = st.file_uploader("Upload an audio clip (MP3 / WAV)", type=["mp3", "wav"], key="single")
 
-                spectrogram, freqs, times = compute_spectrogram(x, fs)
-                spectrogram_db = 20 * np.log10(spectrogram + 1)
-                peaks = find_peaks(spectrogram_db, freqs)
-                fingerprints, _ = build_fingerprints(peaks, freqs, times)
-                best_song, best_count, offset_histogram = match_fingerprints(fingerprints, database)
+    if uploaded:
+        st.audio(uploaded, format="audio/mp3")
 
-            finally:
-                os.unlink(tmp_path)
+        if st.button("🔍 Identify Song"):
+            with st.spinner("Analysing audio…"):
+                suffix = ".mp3" if uploaded.name.endswith(".mp3") else ".wav"
+                best_song, best_count, offset_histogram, spectrogram, freqs, times, peaks, fingerprints = \
+                    process_audio_file(uploaded.read(), suffix, database)
 
-        # ── Result ────────────────────────────────────────────
-        st.markdown("---")
-        if best_song:
-            song_display = os.path.splitext(best_song)[0]
-            st.markdown(f"""
+            st.markdown("---")
+            if best_song:
+                song_display = os.path.splitext(best_song)[0]
+                st.markdown(f"""
 <div class="result-box">
     <p class="score-label">🎶 Matched Song</p>
     <p class="song-title">{song_display}</p>
@@ -305,23 +318,89 @@ if uploaded:
     <p class="score-value">{len(fingerprints)}</p>
 </div>
 """, unsafe_allow_html=True)
-        else:
-            st.markdown("""
+            else:
+                st.markdown("""
 <div class="result-box">
     <p class="no-match">❌ No match found</p>
     <p class="score-label">Try a longer or cleaner audio clip.</p>
 </div>
 """, unsafe_allow_html=True)
 
-        # ── Plots ──────────────────────────────────────────────
-        st.markdown("### 📊 Visualisations")
-        col1, col2 = st.columns(2)
+            st.markdown("### 📊 Visualisations")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.pyplot(plot_spectrogram(spectrogram, freqs, times))
+            with col2:
+                st.pyplot(plot_constellation(spectrogram, freqs, times, peaks))
+            if best_song and offset_histogram:
+                st.pyplot(plot_offset_histogram(offset_histogram, best_song))
 
-        with col1:
-            st.pyplot(plot_spectrogram(spectrogram, freqs, times))
 
-        with col2:
-            st.pyplot(plot_constellation(spectrogram, freqs, times, peaks))
+# ══════════════════════════════════════════════════════════════
+#  TAB 2 — Batch Mode
+# ══════════════════════════════════════════════════════════════
+with tab2:
+    st.markdown("Upload **multiple** audio clips at once. Results are shown in a table and can be downloaded as `results.csv`.")
 
-        if best_song and offset_histogram:
-            st.pyplot(plot_offset_histogram(offset_histogram, best_song))
+    uploaded_batch = st.file_uploader(
+        "Upload audio clips (MP3 / WAV)", type=["mp3", "wav"],
+        accept_multiple_files=True, key="batch"
+    )
+
+    CONFIDENCE_THRESH = st.slider("Confidence threshold", min_value=1, max_value=50, value=5,
+                                  help="Minimum aligned fingerprints required to accept a match.")
+
+    if uploaded_batch:
+        st.info(f"{len(uploaded_batch)} file(s) selected.")
+
+        if st.button("🚀 Run Batch Recognition"):
+
+            results      = []   # (filename, prediction, score)
+            progress_bar = st.progress(0, text="Starting…")
+            status_box   = st.empty()
+
+            for idx, f in enumerate(uploaded_batch):
+                status_box.markdown(f"⏳ Processing **{f.name}** ({idx+1}/{len(uploaded_batch)})…")
+
+                suffix = ".mp3" if f.name.endswith(".mp3") else ".wav"
+                best_song, best_count, _, _, _, _, _, _ = \
+                    process_audio_file(f.read(), suffix, database, CONFIDENCE_THRESH)
+
+                if best_song is not None and best_count >= CONFIDENCE_THRESH:
+                    prediction = os.path.splitext(best_song)[0]
+                else:
+                    prediction = "none"
+
+                results.append((f.name, prediction, best_count))
+                progress_bar.progress((idx + 1) / len(uploaded_batch),
+                                      text=f"{idx+1}/{len(uploaded_batch)} done")
+
+            status_box.success("✅ Batch complete!")
+
+            # ── Results table ──────────────────────────────────
+            st.markdown("### 📋 Results")
+
+            import pandas as pd
+            df = pd.DataFrame(results, columns=["Filename", "Prediction", "Score"])
+
+            def highlight_row(row):
+                if row["Prediction"] == "none":
+                    return ["background-color: #2a1a1a; color: #ff6b6b"] * len(row)
+                return ["background-color: #1a2a1a; color: #00ff88"] * len(row)
+
+            st.dataframe(
+                df.style.apply(highlight_row, axis=1),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            # ── Download CSV ───────────────────────────────────
+            import io
+            csv_buf = io.StringIO()
+            df[["Filename", "Prediction"]].to_csv(csv_buf, index=False)
+            st.download_button(
+                label="⬇️ Download results.csv",
+                data=csv_buf.getvalue(),
+                file_name="results.csv",
+                mime="text/csv"
+            )
