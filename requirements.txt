@@ -5,3 +5,4 @@ matplotlib
 soundfile
 audioread
 gdown
+pandas
